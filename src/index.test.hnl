@@ -69,3 +69,30 @@ test_trace_smoke :: assert m.trace(m.make("trace", null), "smoke trace", null) =
 test_log_bad_level :: assert res_tag(error.try((x) ~> m.log(m.make("info", null), "bogus", "x", null))) = "err"
 test_child_emit :: assert m.info(m.child(m.make("info", { app: "t" }), { req: 7 }), "child smoke", { extra: true }) = null
 test_flush :: assert m.flush(m.make("info", null)) = null
+
+-- syslog sink ----------------------------------------------------------------
+
+test_make_syslog_sink :: assert m.make_syslog("info", null, null).sink = "syslog"
+test_make_syslog_defaults :: assert m.make_syslog("info", null, null).facility = 8
+test_make_syslog_ident :: assert m.make_syslog("info", null, null).ident = "handl"
+test_make_syslog_ident_ptr :: assert type.of(m.make_syslog("info", null, null).ident_ptr) = "number"
+test_make_syslog_opts :: assert m.make_syslog("debug", { a: 1 }, { facility: 24, ident: "svc" }).facility = 24
+test_make_syslog_opts_ident :: assert m.make_syslog("debug", null, { ident: "svc" }).ident = "svc"
+test_make_syslog_attrs :: assert m.make_syslog("info", { a: 1 }, null).attrs = { a: 1 }
+test_make_syslog_bad_level :: assert res_tag(error.try((x) ~> m.make_syslog("bogus", null, null))) = "err"
+test_make_syslog_bad_facility :: assert res_tag(error.try((x) ~> m.make_syslog("info", null, { facility: "x" }))) = "err"
+test_make_syslog_frac_facility :: assert res_tag(error.try((x) ~> m.make_syslog("info", null, { facility: 8.5 }))) = "err"
+test_make_syslog_bad_ident :: assert res_tag(error.try((x) ~> m.make_syslog("info", null, { ident: 5 }))) = "err"
+test_syslog_with_level_keeps :: assert m.with_level(m.make_syslog("info", null, null), "debug").sink = "syslog"
+test_syslog_child_keeps :: assert m.child(m.make_syslog("info", null, null), { a: 1 }).facility = 8
+test_syslog_should_log :: assert m.should_log(m.make_syslog("info", null, null), "warn") = true
+
+-- syslog emission (smoke — records go to syslog(3); silently dropped when
+-- /dev/log is absent, which is correct syslog behaviour) --------------------
+
+test_syslog_log_smoke :: assert m.log(m.make_syslog("info", null, null), "info", "syslog smoke", { a: 1 }) = null
+test_syslog_info_smoke :: assert m.info(m.make_syslog("info", null, null), "syslog info", null) = null
+test_syslog_filtered :: assert m.debug(m.make_syslog("warn", null, null), "never seen", null) = null
+test_syslog_facility_smoke :: assert m.warn(m.make_syslog("warn", null, { facility: 24, ident: "t" }), "fac smoke", null) = null
+test_syslog_child_emit :: assert m.error(m.child(m.make_syslog("error", { app: "t" }, null), { req: 7 }), "child syslog", null) = null
+test_syslog_flush :: assert m.flush(m.make_syslog("info", null, null)) = null

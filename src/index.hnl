@@ -23,11 +23,39 @@
 --- `lib-datetime` uses) formatted `YYYY-MM-DDTHH:MM:SS.mmmZ`. Always
 --- UTC — no `localtime`/`TZ` dependence, so output is reproducible.
 ---
---- Syslog (`openlog`/`syslog`/`vsyslog`) is deliberately NOT in v1:
---- `vsyslog` is variadic (the ffi marshals fixed signatures only) and
---- a correct `syslog` wrapper needs a vsnprintf-style format builder
---- handl cannot express cheaply. Documented as future work; stderr is
---- the honest v1 sink.
+--- Syslog sink: `make_syslog(min, attrs, opts)` builds a logger whose
+--- `sink` field is `"syslog"` — records go to `syslog(3)` instead of
+--- stderr. The variadic problem is sidestepped, not solved: `syslog`'s
+--- format argument is always the constant `"%s"` and the fully-rendered
+--- message rides as the third (vararg) parameter, so the ffi's fixed
+--- three-argument signature `syslog(int, char*, char*)` is exactly what
+--- a C caller would emit (the `curl_easy_setopt` precedent in
+--- lib-fetch-c — SysV passes int/ptr varargs identically, and `"%s"`
+--- never touches the XMM save area). `openlog(ident, LOG_PID, facility)`
+--- is called before each `syslog` so every emit carries the logger's
+--- own ident/facility — openlog is a pure globals-set, idempotent, and
+--- far cheaper than the syslog sendto it precedes.
+---
+--- The syslog line is `msg key=value ...` — NO `LEVEL`/ISO-8601
+--- prefix: syslog stamps its own timestamp and encodes the level in
+--- the priority word (`facility | LOG_*`), so the canonical `format`
+--- header would be redundant noise in `journalctl`/`/var/log`.
+---
+--- `opts` is `null` or a record `{ facility: Int, ident: String }`:
+--- `facility` is the C `LOG_*` constant value (already <<3-shifted —
+--- LOG_USER=8, LOG_DAEMON=24, LOG_LOCAL0=128 .. LOG_LOCAL7=184),
+--- default 8; `ident` is the syslog tag, default `"handl"`. The fields
+--- live on the logger record, so `child`/`with_level` preserve them
+--- for free (the contract's "backends MAY add fields" clause).
+---
+--- `ident` is `strdup`'d once here and the pointer stored as
+--- `ident_ptr`: `openlog` keeps the `ident` pointer (it does NOT copy
+--- the string — glibc stores `LogIdent = ident`), while an ffi `"cstr"`
+--- arg only lives until its call returns. A per-emit `"cstr"` ident
+--- would dangle into freed heap — journal showed `SYSLOG_IDENTIFIER`
+--- as `[5B blob data]`/`proj_child` garbage before this fix. One
+--- strdup per logger is the honest cost (a few bytes, never freed —
+--- idents are few and process-lived).
 ---
 --- `ffi`, `math`, `type`, `hash_map` are host modules on the stdlib
 --- chain — reached by qualified call with no import line (the
@@ -118,6 +146,52 @@ export make := make
 export with_level := with_level
 export child := child
 export should_log := should_log
+
+-- ---------------------------------------------------------------------------
+-- Syslog sink (backend extension — not part of the `log` contract's
+-- minimum surface; see the header for the "%s"-vararg trick)
+-- ---------------------------------------------------------------------------
+
+--- C `LOG_*` level codes for the syslog priority word (DEBUG=7 .. CRIT=2).
+syslog_level := (lvl) ~> if lvl == "trace" || lvl == "debug" {
+  7
+} else if lvl == "info" {
+  6
+} else if lvl == "warn" {
+  4
+} else if lvl == "error" {
+  3
+} else {
+  2
+}
+
+--- make_syslog(min, attrs, opts): a `make` logger whose `sink` is
+--- `"syslog"`. `opts` is null or `{ facility, ident }` — facility is the
+--- C `LOG_*` constant (default LOG_USER = 8), ident the syslog tag
+--- (default `"handl"`). openlog still runs at emit time; the only
+--- eager work is the one-time `strdup` of `ident` (see the header —
+--- the ffi `"cstr"` lifetime is per-call, `openlog` needs it forever).
+make_syslog := (min, attrs, opts) ~> do {
+  need_level(min)
+  o := if opts == null { {} } else { opts }
+  fac := hash_map.get_or(o, "facility", 8)
+  ident := hash_map.get_or(o, "ident", "handl")
+  if type.of(fac) != "number" || math.is_integer(fac) == false {
+    raise("log: syslog: facility must be an integer")
+  } else if type.of(ident) != "string" {
+    raise("log: syslog: ident must be a string")
+  } else {
+    ip := ffi.call(LIBC, "strdup", [ident], ["cstr"], "ptr", false)
+    if ip == 0 {
+      raise("log: syslog: strdup failed")
+    } else {
+      { min_level: min, attrs: attrs_or_empty(attrs),
+        sink: "syslog", facility: fac, ident: ident, ident_ptr: ip }
+    }
+  }
+}
+
+export make_syslog := make_syslog
 
 -- ---------------------------------------------------------------------------
 -- Canonical rendering (contract: format)
@@ -265,15 +339,67 @@ emit := (s) ~> do {
 }
 
 -- ---------------------------------------------------------------------------
+-- Sink: syslog(3) — openlog + syslog("%s", msg) per record (see header).
+-- ---------------------------------------------------------------------------
+
+--- LOG_PID — openlog option: tag every record with the process id.
+LOG_PID := 1
+
+--- `" k=v k=v"` suffix for the merged attrs — the same quoting rules as
+--- `format`, minus the LEVEL/timestamp head syslog supplies itself.
+attrs_suffix := (attrs) ~> while { es: obj.entries(attrs_or_empty(attrs)), acc: "" } {
+  (es, acc) ~> match es {
+    []: { out: acc },
+    [h, ...t]: { state: { es: t, acc: acc + " " + h[0] + "=" + show(h[1]) } }
+  }
+}
+
+--- One syslog record: `openlog(ident, LOG_PID, facility)` then
+--- `syslog(facility | level, "%s", msg + attrs)`. `syslog` returns void
+--- and reports delivery failures only via its own internal logging —
+--- there is no errno to check, so a dropped datagram is silent by
+--- design (same as every syslog client).
+syslog_emit := (l, lvl, msg, attrs) ~> do {
+  fac := hash_map.get_or(l, "facility", 8)
+  ident := hash_map.get_or(l, "ident", "handl")
+  -- `openlog` retains the ident pointer (no copy), so it must outlive
+  -- the call: `make_syslog` loggers carry `ident_ptr` (a strdup'd
+  -- address). A hand-built `{ sink: "syslog" }` record without one
+  -- falls back to a per-emit strdup — correct but leaks per record;
+  -- `make_syslog` is the supported constructor.
+  ip := hash_map.get_or(l, "ident_ptr", null)
+  p := if ip == null {
+    ffi.call(LIBC, "strdup", [ident], ["cstr"], "ptr", false)
+  } else {
+    ip
+  }
+  ffi.call(LIBC, "openlog", [p, LOG_PID, fac],
+    ["ptr", "i32", "i32"], "void", false)
+  ffi.call(LIBC, "syslog",
+    [math.bit_or(fac, syslog_level(lvl)), "%s", msg + attrs_suffix(attrs)],
+    ["i32", "cstr", "cstr"], "void", false)
+  null
+}
+
+--- sink_of(l): the logger's sink tag — `"syslog"` or `"stderr"`.
+sink_of := (l) ~> hash_map.get_or(l, "sink", "stderr")
+
+-- ---------------------------------------------------------------------------
 -- Contract surface — emission (effectful)
 -- ---------------------------------------------------------------------------
 
 --- log(l, lvl, msg, attrs): emit `format(iso_now(), lvl, msg, merged)`
---- to stderr iff should_log. Filtered records are dropped silently.
+--- to the logger's sink (stderr by default, syslog when `l.sink` is
+--- `"syslog"`) iff should_log. Filtered records are dropped silently.
 log := (l, lvl, msg, attrs) ~> do {
   need_level(lvl)
   if should_log(l, lvl) {
-    emit(format(iso_now(), lvl, msg, merge(l.attrs, attrs)))
+    a := merge(l.attrs, attrs)
+    if sink_of(l) == "syslog" {
+      syslog_emit(l, lvl, msg, a)
+    } else {
+      emit(format(iso_now(), lvl, msg, a))
+    }
   } else {
     null
   }

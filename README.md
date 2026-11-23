@@ -16,9 +16,15 @@ stays clean for piped program output. Timestamp is
 civil date (the `lib-datetime` algorithm) as `YYYY-MM-DDTHH:MM:SS.mmmZ`,
 always UTC.
 
-Syslog (`openlog`/`syslog`/`vsyslog`) is deliberately not in v1 —
-`vsyslog` is variadic and the ffi marshals fixed signatures only;
-documented as future work in the module header.
+Syslog sink: `make_syslog(min, attrs, opts)` builds a logger with
+`sink: "syslog"` — records go to `syslog(3)` via
+`openlog(ident, LOG_PID, facility)` + `syslog(facility | level, "%s",
+msg)`. The variadic problem is sidestepped: the format is the constant
+`"%s"` and the rendered message rides as the vararg, so the ffi's fixed
+3-arg signature suffices (the `curl_easy_setopt` precedent). The
+syslog line is `msg key=value ...` — no LEVEL/timestamp prefix, since
+syslog stamps its own and encodes the level in the priority word.
+`opts` = `{ facility, ident }` (defaults `LOG_USER`=8 / `"handl"`).
 
 One implementation note: the module exports an arrow named `error`
 (the error-level convenience), which shadows the host `error` module
@@ -28,7 +34,7 @@ inside the file — so `error.raise` is imported as `raise` up front.
 
 ```text
 src/index.hnl       the .hnl sources (all contract arrows)
-src/index.test.hnl  contract tests — 44 cases, all passing natively
+src/index.test.hnl  contract tests — 64 cases, all passing natively
 pkg.hnl             package manifest — modules, deps, description, license
 ```
 
