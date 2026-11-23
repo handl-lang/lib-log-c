@@ -1,0 +1,10 @@
+-- lib-log-c: package manifest.
+{
+  deps: { grade: "branch:main", log: "branch:main" },
+  modules: ["log-c"],
+  name: "log-c",
+  description: "C backend for the log contract — leveled records to stderr over libc stdio via ffi.call.",
+  license: "MIT",
+  keywords: ["log", "logging", "stderr", "libc", "ffi", "backend"],
+  homepage: "https://github.com/handl-lang/lib-log-c",
+}

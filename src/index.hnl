@@ -1,0 +1,293 @@
+--- log-c -- the libc backend for the `log` contract.
+---
+--- Leveled records to **stderr** over `ffi.call("libc.so.6", ...)` —
+--- no posix dep, no generated adapter, no shell. The sink is libc
+--- stdio's `stderr` FILE*: unbuffered under the C stdio model, so each
+--- `log` reaches the kernel promptly — the right channel for
+--- diagnostics that must not be lost and must not pollute stdout
+--- (piped/redirected program output stays clean).
+---
+--- Line format (the contract's canonical `format`):
+---
+---   LEVEL ISO-8601-UTC message key=value key=value ...
+---
+--- e.g. `INFO 2026-11-22T19:42:07.123Z worker started pid=42`.
+--- Attrs render in record order; string values are quoted only when
+--- they contain characters outside the safe set `[A-Za-z0-9_./:@+-]`
+--- (spaces, quotes, backslashes, controls), with `"` and `\` escaped —
+--- the slog TextHandler convention. Non-string values render through
+--- `type.to_string`.
+---
+--- Timestamp: `clock_gettime(CLOCK_REALTIME)` -> epoch ms -> proleptic
+--- Gregorian civil date (the days-from-civil algorithm, same one
+--- `lib-datetime` uses) formatted `YYYY-MM-DDTHH:MM:SS.mmmZ`. Always
+--- UTC — no `localtime`/`TZ` dependence, so output is reproducible.
+---
+--- Syslog (`openlog`/`syslog`/`vsyslog`) is deliberately NOT in v1:
+--- `vsyslog` is variadic (the ffi marshals fixed signatures only) and
+--- a correct `syslog` wrapper needs a vsnprintf-style format builder
+--- handl cannot express cheaply. Documented as future work; stderr is
+--- the honest v1 sink.
+---
+--- `ffi`, `math`, `type`, `hash_map` are host modules on the stdlib
+--- chain — reached by qualified call with no import line (the
+--- intl-c/stdio-c convention). `str`, `bytes`, `obj`, `char` are
+--- stdlib modules. `error` is imported as `raise` because this module
+--- EXPORTS an arrow named `error` (the fatal-level convenience), which
+--- would otherwise shadow the host `error` module inside the file.
+
+from "str" import * as strm
+from "bytes" import * as bytesm
+from "obj" import * as obj
+from "char" import * as charm
+from "error" import { raise }
+
+LIBC := "libc.so.6"
+
+--- errno retried rather than raised.
+EINTR := 4
+
+-- ---------------------------------------------------------------------------
+-- Levels (contract: "trace" < "debug" < "info" < "warn" < "error" < "fatal")
+-- ---------------------------------------------------------------------------
+
+--- rank: 0..5 for the six level names, -1 for anything else.
+rank := (lvl) ~> if lvl == "trace" {
+  0
+} else if lvl == "debug" {
+  1
+} else if lvl == "info" {
+  2
+} else if lvl == "warn" {
+  3
+} else if lvl == "error" {
+  4
+} else if lvl == "fatal" {
+  5
+} else {
+  -1
+}
+
+--- Reject an unrecognised level — `log: unknown level '<name>'`.
+need_level := (lvl) ~> if rank(lvl) < 0 {
+  raise("log: unknown level '" + type.to_string(lvl) + "'")
+} else {
+  null
+}
+
+-- ---------------------------------------------------------------------------
+-- Pure logger algebra (contract: make / with_level / child / should_log)
+-- ---------------------------------------------------------------------------
+
+--- attrs_or_empty: null -> {}, record -> itself.
+attrs_or_empty := (a) ~> if a == null { {} } else { a }
+
+--- merge(base, extra): `extra`'s entries set over `base` — the
+--- right-hand (child/event) value wins on a key collision.
+merge := (base, extra) ~> if extra == null {
+  base
+} else {
+  while { es: obj.entries(extra), acc: base } {
+    (es, acc) ~> match es {
+      []: { out: acc },
+      [h, ...t]: { state: { es: t, acc: obj.set(acc, h[0], h[1]) } }
+    }
+  }
+}
+
+--- make(min, attrs): `{ min_level, attrs }` — attrs normalised to {}.
+make := (min, attrs) ~> do {
+  need_level(min)
+  { min_level: min, attrs: attrs_or_empty(attrs) }
+}
+
+--- with_level(l, lvl): l with min_level replaced (extra fields kept).
+with_level := (l, lvl) ~> do {
+  need_level(lvl)
+  obj.set(l, "min_level", lvl)
+}
+
+--- child(l, attrs): l with `attrs` merged into its carried attrs.
+child := (l, attrs) ~> obj.set(l, "attrs", merge(l.attrs, attrs))
+
+--- should_log(l, lvl): rank(lvl) >= rank(l.min_level); unknown -> false.
+should_log := (l, lvl) ~> rank(lvl) >= rank(l.min_level)
+
+export level_rank := rank
+export make := make
+export with_level := with_level
+export child := child
+export should_log := should_log
+
+-- ---------------------------------------------------------------------------
+-- Canonical rendering (contract: format)
+-- ---------------------------------------------------------------------------
+
+--- Chars that never force quoting: ASCII alnum plus _./:@+-.
+SAFE := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./:@+-"
+
+--- needs_quote(s): empty or any char outside SAFE.
+needs_quote := (s) ~> do {
+  if strm.length(s) == 0 {
+    true
+  } else {
+    while { cs: charm.chars(s), bad: false } {
+      (cs, bad) ~> match cs {
+        []: { out: bad },
+        [c, ...t]: { state: { cs: t, bad: bad || strm.find(SAFE, c) < 0 } }
+      }
+    }
+  }
+}
+
+--- Escape `"` and `\` inside a quoted string.
+esc := (s) ~> while { cs: charm.chars(s), acc: "" } {
+  (cs, acc) ~> match cs {
+    []: { out: acc },
+    ["\\", ...t]: { state: { cs: t, acc: acc + "\\\\" } },
+    ["\"", ...t]: { state: { cs: t, acc: acc + "\\\"" } },
+    [c, ...t]: { state: { cs: t, acc: acc + c } }
+  }
+}
+
+--- Render one attr value: strings quoted iff needed, else type.to_string.
+show := (v) ~> if type.of(v) == "string" {
+  if needs_quote(v) { "\"" + esc(v) + "\"" } else { v }
+} else {
+  type.to_string(v)
+}
+
+--- format(ts, lvl, msg, attrs): `"LEVEL ts msg k=v ..."` — level
+--- uppercased, attrs in record order, null attrs render nothing.
+format := (ts, lvl, msg, attrs) ~> do {
+  need_level(lvl)
+  head := strm.upper(lvl) + " " + ts + " " + msg
+  a := attrs_or_empty(attrs)
+  while { es: obj.entries(a), acc: head } {
+    (es, acc) ~> match es {
+      []: { out: acc },
+      [h, ...t]: { state: { es: t, acc: acc + " " + h[0] + "=" + show(h[1]) } }
+    }
+  }
+}
+
+export format := format
+
+-- ---------------------------------------------------------------------------
+-- Timestamp: clock_gettime(CLOCK_REALTIME) -> ISO-8601 UTC, ms precision.
+-- ---------------------------------------------------------------------------
+
+CLOCK_REALTIME := 0
+
+--- `strerror(errno)` — the C message, or a bare "errno <n>".
+strerror := (n) ~> do {
+  s := ffi.call(LIBC, "strerror", [n], ["i32"], "cstr", false)
+  if s == null { "errno " + type.to_string(n) } else { s }
+}
+
+--- clock_gettime(2) -> epoch milliseconds (the posix-c `read_ns`
+--- shape: out_struct into libc, errno on failure).
+now_ms := () ~> do {
+  r := ffi.call(LIBC, "clock_gettime", [CLOCK_REALTIME],
+    ["i32", "out_struct:{tv_sec:i64,tv_nsec:i64}"], "i32", false)
+  if r.ret < 0 {
+    raise("log: clock_gettime: " + strerror(ffi.errno()))
+  } else {
+    r.buf.tv_sec * 1000 + math.floor_div(r.buf.tv_nsec, 1000000)
+  }
+}
+
+pad2 := (n) ~> strm.pad_left(type.to_string(n), 2, "0")
+pad4 := (n) ~> strm.pad_left(type.to_string(n), 4, "0")
+
+--- Proleptic Gregorian civil date from days since 1970-01-01
+--- (Howard Hinnant's civil_from_days — the lib-datetime algorithm).
+civil := (days) ~> do {
+  z := days + 719468
+  era := math.floor_div(z, 146097)
+  doe := z - era * 146097
+  yoe := math.floor_div(doe - math.floor_div(doe, 1460)
+    + math.floor_div(doe, 36524) - math.floor_div(doe, 146096), 365)
+  y := yoe + era * 400
+  doy := doe - (365 * yoe + math.floor_div(yoe, 4) - math.floor_div(yoe, 100))
+  mp := math.floor_div(5 * doy + 2, 153)
+  d := doy - math.floor_div(153 * mp + 2, 5) + 1
+  m := mp + (if mp < 10 { 3 } else { 0 - 9 })
+  { y: y + (if m <= 2 { 1 } else { 0 }), m: m, d: d }
+}
+
+--- ISO-8601 UTC timestamp with millisecond precision:
+--- `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+iso_now := () ~> do {
+  ms := now_ms()
+  days := math.floor_div(ms, 86400000)
+  sod := ms - days * 86400000
+  c := civil(days)
+  hh := math.floor_div(sod, 3600000)
+  mi := math.floor_div(sod - hh * 3600000, 60000)
+  ss := math.floor_div(sod - hh * 3600000 - mi * 60000, 1000)
+  mmm := sod - hh * 3600000 - mi * 60000 - ss * 1000
+  pad4(c.y) + "-" + pad2(c.m) + "-" + pad2(c.d)
+    + "T" + pad2(hh) + ":" + pad2(mi) + ":" + pad2(ss)
+    + "." + strm.pad_left(type.to_string(mmm), 3, "0") + "Z"
+}
+
+-- ---------------------------------------------------------------------------
+-- Sink: fwrite(line + "\n", stderr FILE*) — libc owns the (un)buffering.
+-- ---------------------------------------------------------------------------
+
+--- Resolve a libc global data symbol and read the pointer it stores
+--- (`stderr` is a `FILE *` global — the stdio-c `file_stream` pattern).
+file_stream := (name) ~> do {
+  r := ffi.sym(LIBC, name)
+  if hash_map.get_or(r, "__tag__", "") != "ok" {
+    raise("log: " + name + ": "
+      + type.to_string(hash_map.get_or(r, "value", "")))
+  } else {
+    ffi.read(hash_map.get_or(r, "value", 0), "ptr")
+  }
+}
+
+--- One `fwrite` of `s` + "\n" to stderr. `in_buf` expands the Bytes to
+--- C's (ptr, len) pair, so the call marshals as
+--- `fwrite(ptr, len, 1, stream)` — size=len, nmemb=1, and the return is
+--- the item count: 1 on success, 0 on error (the stdio-c convention).
+emit := (s) ~> do {
+  b := bytesm.utf8_encode(s + "\n")
+  stream := file_stream("stderr")
+  r := ffi.call(LIBC, "fwrite", [b, 1, stream],
+    ["in_buf", "i64", "ptr"], "i64", false)
+  if r != 1 {
+    raise("log: write: " + strerror(ffi.errno()))
+  } else {
+    null
+  }
+}
+
+-- ---------------------------------------------------------------------------
+-- Contract surface — emission (effectful)
+-- ---------------------------------------------------------------------------
+
+--- log(l, lvl, msg, attrs): emit `format(iso_now(), lvl, msg, merged)`
+--- to stderr iff should_log. Filtered records are dropped silently.
+log := (l, lvl, msg, attrs) ~> do {
+  need_level(lvl)
+  if should_log(l, lvl) {
+    emit(format(iso_now(), lvl, msg, merge(l.attrs, attrs)))
+  } else {
+    null
+  }
+}
+
+export log := log
+
+--- Per-level conveniences — `log` with the level fixed.
+export trace := (l, msg, attrs) ~> log(l, "trace", msg, attrs)
+export debug := (l, msg, attrs) ~> log(l, "debug", msg, attrs)
+export info  := (l, msg, attrs) ~> log(l, "info",  msg, attrs)
+export warn  := (l, msg, attrs) ~> log(l, "warn",  msg, attrs)
+export error := (l, msg, attrs) ~> log(l, "error", msg, attrs)
+export fatal := (l, msg, attrs) ~> log(l, "fatal", msg, attrs)
+
+--- flush(l): stderr is unbuffered — contract no-op.
+export flush := (l) ~> null
