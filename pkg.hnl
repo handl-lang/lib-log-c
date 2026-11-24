@@ -1,6 +1,6 @@
 -- lib-log-c: package manifest.
 {
-  deps: { grade: "branch:main", log: "branch:main" },
+  deps: { log: "branch:main" },
   modules: ["log-c"],
   name: "log-c",
   description: "C backend for the log contract — leveled records to stderr or syslog over libc via ffi.call.",
